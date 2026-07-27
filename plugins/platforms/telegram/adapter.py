@@ -4313,6 +4313,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Guest Bot support: use answer_guest_query ONLY for the final response
+        # (marked with metadata["notify"]=True). Intermediate/status messages
+        # (redirects, typing, etc.) must NOT consume the guest_query_id.
+        is_final = (metadata or {}).get("notify", False)
+        pending_queries = getattr(self, "_pending_guest_queries", {})
+        guest_query_id = pending_queries.get(str(chat_id))
+        if guest_query_id and is_final:
+            # Final response — consume query and send via answer_guest_query
+            pending_queries.pop(str(chat_id), None)
+            success = await self._send_guest_response(chat_id, content, guest_query_id)
+            if not success:
+                logger.warning("[Telegram] answer_guest_query failed, falling back to regular send")
+            else:
+                return SendResult(success=True, message_id=None)
+        elif guest_query_id and not is_final:
+            # Intermediate message — suppress (guest mode doesn't support streaming)
+            logger.debug("[Telegram] Suppressing intermediate guest response (%d chars)", len(content or ""))
+            return SendResult(success=True, message_id=None)
+
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
@@ -9144,6 +9163,106 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await self.handle_message(event)
+
+
+    async def _handle_guest_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle incoming guest messages (Bot API 10.0 Guest Bot feature).
+
+        When a user @mentions the bot in a chat where the bot is not a member,
+        Telegram sends the message as ``update.guest_message`` instead of
+        ``update.message``.  The bot must respond via ``answer_guest_query``
+        using an ``InlineQueryResult``.
+
+        Guest messages bypass the normal authorization flow because the user
+        has explicitly chosen to interact with the bot by mentioning it.
+        """
+        msg = update.guest_message
+        if not msg:
+            return
+
+        guest_query_id = getattr(msg, "guest_query_id", None)
+        if not guest_query_id:
+            logger.warning("[Telegram] Guest message missing guest_query_id, skipping")
+            return
+
+        # Check user authorization BEFORE processing
+        sender = getattr(msg, "from_user", None)
+        sender_id = str(getattr(sender, "id", "")) if sender else ""
+        chat_obj = getattr(msg, "chat", None)
+        chat_id_val = str(getattr(chat_obj, "id", "")) if chat_obj else ""
+        chat_type = "group" if getattr(chat_obj, "type", "") in ("group", "supergroup") else "dm"
+        
+        # Check allowlists
+        if chat_type in ("group", "forum", "channel"):
+            allowed_users = self.config.extra.get("group_allow_from")
+        else:
+            allowed_users = self.config.extra.get("allow_from")
+        
+        if allowed_users is not None:
+            allowed_set = set(str(u) for u in (allowed_users if isinstance(allowed_users, list) else [allowed_users]))
+            if sender_id not in allowed_set and "*" not in allowed_set:
+                logger.warning(
+                    "[Telegram] Blocked unauthorized user %s in chat %s",
+                    sender_id, chat_id_val,
+                )
+                return
+        
+        logger.info(
+            "[Telegram] Guest message from user %s in chat %s (query_id=%s)",
+            sender_id, chat_id_val, guest_query_id,
+        )
+
+        # Extract text content
+        text = msg.text or msg.caption or ""
+        if not text:
+            logger.info("[Telegram] Guest message has no text/caption, skipping")
+            return
+
+        # Build a MessageEvent for the agent
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = self._clean_bot_trigger_text(text)
+
+        # Mark this as a guest message so the send path uses answer_guest_query
+        event.metadata = event.metadata or {}
+        event.metadata["guest_query_id"] = guest_query_id
+        event.metadata["is_guest_message"] = True
+
+        # Get chat_id for storing the query
+        chat_id_str = str(getattr(getattr(msg, "chat", None), "id", ""))
+
+        # Store the guest_query_id on the adapter for the send path
+        if not hasattr(self, "_pending_guest_queries"):
+            self._pending_guest_queries = {}
+        self._pending_guest_queries[chat_id_str] = guest_query_id
+
+        await self.handle_message(event)
+
+    async def _send_guest_response(self, chat_id: str, content: str, guest_query_id: str) -> bool:
+        """Send a response to a guest message using answer_guest_query."""
+        if not self._bot or not guest_query_id:
+            return False
+
+        try:
+            from telegram import InlineQueryResultArticle, InputTextMessageContent
+
+            # Format the message for Telegram
+            formatted = self.format_message(content)
+
+            result = InlineQueryResultArticle(
+                id=guest_query_id,
+                title="Hermes Response",
+                input_message_content=InputTextMessageContent(
+                    message_text=formatted,
+                    parse_mode="MarkdownV2",
+                ),
+            )
+
+            await self._bot.answer_guest_query(guest_query_id, result)
+            logger.info("[Telegram] Sent guest response via answer_guest_query")
+            return True
+        except Exception as e:
+            logger.warning("[Telegram] Failed to send guest response: %s", e)
+            return False
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
